@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.51.1] — 2026-10-06
+## [1.51.1] — 2026-10-07
 
 ### Fixed
 
@@ -56,8 +56,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `YXmlFragment.Insert` now panic at the call site when the result would
   contain itself, like the existing double-staging check.
 
+- **`crdt`: a `YArray.Move` could be lost or rendered in the wrong place.**
+  A client moving an element it had already moved did nothing, because the
+  new move lost arbitration to its own earlier one; the latest move by a client
+  now wins, by one rule applied at integration, pending-move resolution and
+  re-arbitration (#276). Undoing the delete of a moved element restored it at
+  its pre-move position; it now returns to the move destination (#277).
+  `YArrayEvent.Delta` now reports undoing a move, a target passing to another
+  move, and deleting a moved element (#275).
+
+- **`crdt`: `RunGC` could make peers diverge on maps.** Its tombstone merge
+  pass merged items of different map keys and left a key's map entry pointing
+  at an absorbed item, so a later concurrent `Set` diverged. Merges now require
+  the same parent, key and move owner, as yjs's `mergeWith` does (#282).
+
+- **`crdt`: remaining `UndoManager` differences from yjs.** Restored map values
+  now compete in yjs's first-delete client order, runs yjs would merge are
+  restored as one item (so a concurrent insert no longer lands inside them),
+  and a remote tombstone inside a deleted map no longer blocks restoring the
+  key (#278).
+
+- **`crdt`: one detached XML node could be staged into two parents** (#279),
+  **XML attributes stored as `ContentJSON` read as missing, and map reads
+  returned the first value of a multi-value item** where yjs returns the last
+  (#280).
+
+- **`crdt`: `YMap.Set` could silently lose a write.** It used the replaced
+  entry's first ID as the new item's origin. When the entry was a merged run
+  from yjs (two sets of one key in one transaction, then a delete), a writer
+  with a lower client ID than the run's author kept the value locally, but every
+  other peer and yjs dropped it. `Set` and XML `SetAttribute` now take the
+  entry's last ID, as yjs does, and a split entry keeps its key pointing at the
+  last unit (yjs `splitItem`), so this also holds for runs a pre-1.51.1 ygo
+  peer has already split.
+
+- **`crdt`: `YText.ApplyDelta` dropped embeds,** so copying a text with
+  `ApplyDelta(ToDelta())` or forwarding observer deltas lost every embed and its
+  formatting. Embeds are now inserted, byte-identical to yjs's `applyDelta`.
+
+- **`crdt`: values JSON cannot encode were silently written as `null`** in
+  embeds and text attributes (#283). Functions, channels and complex numbers
+  now panic at the call. Non-finite numbers are kept (a yjs peer can send them)
+  and written as `null` individually in V1, as `JSON.stringify` does. Values
+  are normalised to the lib0 `Any` form at the call (`json.Number`, typed
+  slices and maps, structs, pointers), so a value that encoded in V1 can no
+  longer make every later V2 encode of the doc panic.
+
+- **`crdt`: undoing the delete of a re-moved element** now steps back through
+  each of its moves.
+
 ### Changed
 
+- `YXmlFragment.Insert` (and `InsertElement`/`InsertText`) panic when a node
+  is already attached, staged on another parent, or passed twice.
+- `YText.Insert`, `InsertEmbed`, `Format` and `ApplyDelta` store values in
+  normalised form (an `int32` reads back as `int64`, a struct as
+  `map[string]any` using its JSON tags), and panic on functions, channels,
+  complex numbers, nesting deeper than 100 levels, and shared types or `*Doc`
+  anywhere in a value (previously written as `{}` in V1, failing V2).
+- When another client's restored copy of a moved element owns its moves, a
+  later move by a third client can win where the original mover's would have.
+  Every peer still agrees.
+- Reusing a child of a detached XML node that was never attached in another
+  parent now panics; the node is still staged on its first parent. Delete it
+  from that parent first.
+- When the same client moves an element twice, the second move wins.
 - `Transaction.Local` is `false` inside `ApplyUpdate`, `ApplyUpdateV1` and
   `ApplyUpdateV2`. Observers that read it now see `false` for remote changes.
 - `UndoManager` never captures remote updates, even with

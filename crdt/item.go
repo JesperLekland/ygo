@@ -253,15 +253,12 @@ func (item *Item) integrate(txn *Transaction, offset int) {
 
 	// ContentMove priority arbitration: resolve the target item (splitting if
 	// needed so it covers exactly TargetLen elements) and claim it if we are the
-	// winning move. Lower ClientID wins for concurrent moves from different peers;
-	// for same-client sequential moves the earlier (lower-clock) move stays as
-	// winner so that re-moves are not silently ignored — callers should delete
-	// the old ContentMove first when they want to supersede it.
+	// winning move under moveBeats.
 	if cm, ok := item.Content.(*ContentMove); ok && !item.Deleted && cm.Target != nil {
 		target := resolveMovedItem(txn, cm.Target, cm.TargetLen)
 		if target != nil {
-			if target.MovedBy == nil || item.ID.Client < target.MovedBy.ID.Client {
-				target.MovedBy = item
+			if moveBeats(item, target.MovedBy) {
+				txn.setMovedBy(target, item)
 			}
 		} else {
 			// The target has not been integrated yet — common on a fresh peer
@@ -374,6 +371,17 @@ func (item *Item) integrate(txn *Transaction, offset int) {
 	}
 }
 
+// lastID is the ID of the item's last clock unit (Yjs item.lastId), the
+// origin a successor needs: a merged run's first ID would place it before the
+// run's later units.
+func (item *Item) lastID() ID {
+	id := item.ID
+	if n := item.Content.Len(); n > 0 {
+		id.Clock += uint64(n) - 1
+	}
+	return id
+}
+
 // delete marks this item as a tombstone. The item stays in the linked list so
 // that position references from other items (via Origin) remain valid.
 //
@@ -470,6 +478,10 @@ func splitItem(txn *Transaction, item *Item, offset int) *Item {
 	}
 	item.Right = right
 	txn.doc.store.insertItem(right)
+	// A key's entry is its rightmost unit, so Set's origin stays the run's end.
+	if item.ParentSub != nil && item.Parent != nil && item.Parent.itemMap[*item.ParentSub] == item {
+		item.Parent.itemMap[*item.ParentSub] = right
+	}
 	// A split does not move any rendered position — the two halves occupy exactly
 	// the range the original item did, and a marker pointing at the original
 	// (now-left) half keeps a correct rendered start (renderedStep recomputes its
@@ -500,6 +512,18 @@ func originIDEquals(a, b *ID) bool {
 	return a.Client == b.Client && a.Clock == b.Clock
 }
 
+// setMovedBy reassigns target's winning move, remembering the pre-transaction
+// winner the first time so computeDelta can tell where the target rendered.
+func (txn *Transaction) setMovedBy(target, move *Item) {
+	if _, seen := txn.movedBefore[target]; !seen {
+		if txn.movedBefore == nil {
+			txn.movedBefore = make(map[*Item]*Item)
+		}
+		txn.movedBefore[target] = target.MovedBy
+	}
+	target.MovedBy = move
+}
+
 // rearbitrateMove releases a target whose winning move was just tombstoned and
 // queues it for rearbitrateMoves at commit. Without this the target kept
 // MovedBy pointing at a dead move: still counted in length, rendered nowhere.
@@ -511,7 +535,7 @@ func rearbitrateMove(txn *Transaction, move *Item, cm *ContentMove) {
 	if target == nil || target.MovedBy != move {
 		return
 	}
-	target.MovedBy = nil
+	txn.setMovedBy(target, nil)
 	if txn.rearbitrate == nil {
 		txn.rearbitrate = make(map[*abstractType]map[*Item]struct{})
 	}
@@ -523,18 +547,30 @@ func rearbitrateMove(txn *Transaction, move *Item, cm *ContentMove) {
 	set[target] = struct{}{}
 }
 
-// rearbitrateMoves hands each queued target to its next live move by the
-// integrate rule (lowest ClientID, then earliest clock), or back to its
-// origin when none remains. One pass per parent keeps a delete of many
-// winning moves linear rather than one list scan per move; a deleted parent
-// (a cascade) renders nothing, so it is skipped.
+// moveBeats reports whether move m takes its target from the current winner
+// w: the lowest ClientID wins, and within one client the latest move. This is
+// a total order over live moves, so every peer picks the same winner.
+func moveBeats(m, w *Item) bool {
+	if w == nil {
+		return true
+	}
+	if m.ID.Client != w.ID.Client {
+		return m.ID.Client < w.ID.Client
+	}
+	return m.ID.Clock > w.ID.Clock
+}
+
+// rearbitrateMoves hands each queued target to its next live move by
+// moveBeats, or back to its origin when none remains. One pass per parent
+// keeps a delete of many winning moves linear rather than one list scan per
+// move; a deleted parent (a cascade) renders nothing, so it is skipped.
 func rearbitrateMoves(txn *Transaction) {
 	for parent, targets := range txn.rearbitrate {
 		if pi := parent.item; pi != nil && pi.Deleted {
 			continue
 		}
 		for target := range targets {
-			target.MovedBy = nil
+			txn.setMovedBy(target, nil)
 		}
 		for it := parent.start; it != nil; it = it.Right {
 			c, ok := it.Content.(*ContentMove)
@@ -545,9 +581,8 @@ func rearbitrateMoves(txn *Transaction) {
 			if _, queued := targets[target]; !queued {
 				continue
 			}
-			if w := target.MovedBy; w == nil || it.ID.Client < w.ID.Client ||
-				(it.ID.Client == w.ID.Client && it.ID.Clock < w.ID.Clock) {
-				target.MovedBy = it
+			if moveBeats(it, target.MovedBy) {
+				txn.setMovedBy(target, it)
 			}
 		}
 		parent.clearMarkers()

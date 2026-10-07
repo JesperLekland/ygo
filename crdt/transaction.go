@@ -30,6 +30,9 @@ type Transaction struct {
 	// rearbitrate queues, per parent, move targets whose winning ContentMove
 	// was tombstoned; rearbitrateMoves resolves them in one pass at commit.
 	rearbitrate map[*abstractType]map[*Item]struct{}
+	// movedBefore holds each move target's MovedBy as it was before this
+	// transaction first changed it, so YArray deltas can diff the old render.
+	movedBefore map[*Item]*Item
 	// subdocsAdded/subdocsRemoved/subdocsLoaded track subdocument lifecycle
 	// changes made during this transaction (#63). Populated by Item.integrate
 	// and Item.delete when the item's Content is a *ContentDoc. Reconciled
@@ -414,7 +417,10 @@ func tryMergeWithLeft(item *Item, store *StructStore) bool {
 		return false
 	}
 
-	// Splice item out of the linked list.
+	// Splice item out of the linked list; a key entry moves to the merged item.
+	if item.ParentSub != nil && item.Parent != nil && item.Parent.itemMap[*item.ParentSub] == item {
+		item.Parent.itemMap[*item.ParentSub] = left
+	}
 	left.Right = item.Right
 	if item.Right != nil {
 		item.Right.Left = left

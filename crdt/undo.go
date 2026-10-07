@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 	"reflect"
-	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -389,7 +389,7 @@ func (u *UndoManager) applyStackItem(item *StackItem, others []DeleteSet) *Stack
 		// the same stack item were created and deleted within it, so they stay
 		// deleted (Yjs popStackItem).
 		var toRedo []*Item
-		redoSet := make(map[*Item]struct{})
+		pass := &redoPass{set: make(map[*Item]struct{}), insertions: item.insertions, others: others}
 		u.iterateItems(txn, item.deletions, func(it *Item) {
 			if !it.Deleted || !u.itemInScope(it) || item.insertions.IsDeleted(it.ID) {
 				return
@@ -399,12 +399,25 @@ func (u *UndoManager) applyStackItem(item *StackItem, others []DeleteSet) *Stack
 				return
 			}
 			toRedo = append(toRedo, it)
-			redoSet[it] = struct{}{}
+			pass.set[it] = struct{}{}
 		})
-		for _, it := range toRedo {
-			if u.redoItem(txn, it, redoSet, item.insertions, others) != nil {
+		// Yjs restores a run it holds as one struct as one item, which places a
+		// concurrent insert differently than per-item copies, so group runs
+		// before any redo splices between them. A restored move redoes its
+		// target first; that target ends its run.
+		merged := make([]bool, len(toRedo))
+		for i := 1; i < len(toRedo); i++ {
+			merged[i] = yjsMergeable(toRedo[i-1], toRedo[i])
+		}
+		for i := 0; i < len(toRedo); {
+			j := i + 1
+			for toRedo[i].redone == nil && j < len(toRedo) && merged[j] && toRedo[j].redone == nil {
+				j++
+			}
+			if u.redoItem(txn, toRedo[i], toRedo[i+1:j], pass) != nil {
 				performed = true
 			}
+			i = j
 		}
 		if !performed {
 			return
@@ -436,8 +449,9 @@ func (u *UndoManager) applyStackItem(item *StackItem, others []DeleteSet) *Stack
 // (now-tombstoned) neighbours, which preserves order. A child of a deleted
 // nested type is placed into the type's redone copy, redoing the container
 // first when it is in redoSet. Mirrors Yjs redoItem.
-// Returns the new item, or nil if it cannot be placed.
-func (u *UndoManager) redoItem(txn *Transaction, item *Item, redoSet map[*Item]struct{}, insertions DeleteSet, others []DeleteSet) *Item {
+// rest are items following item that Yjs holds merged with it; their content
+// is appended to the copy. Returns the new item, or nil if it cannot be placed.
+func (u *UndoManager) redoItem(txn *Transaction, item *Item, rest []*Item, p *redoPass) *Item {
 	if item.redone != nil {
 		return u.doc.store.getItemCleanStart(txn, *item.redone)
 	}
@@ -447,7 +461,7 @@ func (u *UndoManager) redoItem(txn *Transaction, item *Item, redoSet map[*Item]s
 	}
 	if pi := parent.item; pi != nil && pi.Deleted {
 		if pi.redone == nil {
-			if _, ok := redoSet[pi]; !ok || u.redoItem(txn, pi, redoSet, insertions, others) == nil {
+			if _, ok := p.set[pi]; !ok || u.redoItem(txn, pi, nil, p) == nil {
 				return nil
 			}
 		}
@@ -459,6 +473,21 @@ func (u *UndoManager) redoItem(txn *Transaction, item *Item, redoSet map[*Item]s
 			return nil
 		}
 		parent = ct.Type
+	}
+
+	content := item.Content.Copy()
+	if cm, ok := content.(*ContentMove); ok && cm.Target != nil {
+		// A restored move targets its target's restored copy, redoing that first
+		// when this undo restores it too.
+		if t := u.doc.store.Find(*cm.Target); t != nil {
+			if _, ok := p.set[t]; ok && t.redone == nil {
+				u.redoItem(txn, t, nil, p)
+			}
+			if t = u.followRedone(txn, t); t != nil && t.ID != *cm.Target {
+				// The copy may hold a merged run; TargetLen trims it.
+				content = NewContentMove(&t.ID, cm.TargetLen)
+			}
+		}
 	}
 
 	var left, right *Item
@@ -503,7 +532,7 @@ func (u *UndoManager) redoItem(txn *Transaction, item *Item, redoSet map[*Item]s
 		// that are undo/redo history; any other later value is a remote edit,
 		// which undo must not overwrite (Yjs redoItem).
 		left = item
-		for r := nextSameKey(left); r != nil && (r.redone != nil || insertions.IsDeleted(r.ID) || deletedByStacks(others, r.ID)); r = nextSameKey(left) {
+		for r := nextSameKey(left); r != nil && (r.redone != nil || p.insertions.IsDeleted(r.ID) || deletedByStacks(p.others, r.ID) || collectedWithParent(r)); r = nextSameKey(left) {
 			left = u.followRedone(txn, r)
 		}
 		if left == nil || nextSameKey(left) != nil {
@@ -520,6 +549,7 @@ func (u *UndoManager) redoItem(txn *Transaction, item *Item, redoSet map[*Item]s
 	}
 
 	origin, originRight := neighbourOrigins(left, right)
+	content = appendContents(content, rest)
 	ni := &Item{
 		ID:          ID{Client: txn.doc.clientID, Clock: txn.doc.store.NextClock(txn.doc.clientID)},
 		Origin:      origin,
@@ -527,12 +557,134 @@ func (u *UndoManager) redoItem(txn *Transaction, item *Item, redoSet map[*Item]s
 		Left:        left,
 		Parent:      parent,
 		ParentSub:   item.ParentSub,
-		Content:     item.Content.Copy(),
+		Content:     content,
 	}
 	nid := ni.ID
 	item.redone = &nid
+	off := uint64(item.Content.Len())
+	for _, r := range rest {
+		r.redone = &ID{Client: nid.Client, Clock: nid.Clock + off}
+		off += uint64(r.Content.Len())
+	}
 	ni.integrate(txn, 0)
+	if item.MovedBy != nil && item.Parent == parent {
+		for _, mv := range p.movesOf(u.doc.store, item) {
+			u.redoMove(txn, mv, ni)
+		}
+	}
 	return ni
+}
+
+// redoPass is the state one applyStackItem shares across its redoItem calls.
+type redoPass struct {
+	set        map[*Item]struct{} // items this undo restores
+	insertions DeleteSet          // the stack item's insertions
+	others     []DeleteSet        // the other stack items' deletions
+	moves      map[*abstractType]map[*Item][]*Item
+}
+
+// movesOf returns the live moves of target in its parent, lowest priority
+// (moveBeats) first. Each parent is indexed once per pass.
+func (p *redoPass) movesOf(store *StructStore, target *Item) []*Item {
+	parent := target.Parent
+	idx, ok := p.moves[parent]
+	if !ok {
+		idx = make(map[*Item][]*Item)
+		for it := parent.start; it != nil; it = it.Right {
+			if cm, ok := it.Content.(*ContentMove); ok && !it.Deleted && cm.Target != nil {
+				if t := store.Find(*cm.Target); t != nil {
+					idx[t] = append(idx[t], it)
+				}
+			}
+		}
+		for _, ms := range idx {
+			sort.Slice(ms, func(i, j int) bool { return moveBeats(ms[j], ms[i]) })
+		}
+		if p.moves == nil {
+			p.moves = make(map[*abstractType]map[*Item][]*Item)
+		}
+		p.moves[parent] = idx
+	}
+	return idx[target]
+}
+
+// redoMove gives target, the restored copy of mv's deleted target, a new move
+// right after mv. Callers pass the original's live moves in rising priority,
+// so the copies rank as the originals did. mv is tombstoned and redone as the
+// new move, so undoing mv's insertion deletes that and a redone link never
+// sits on a live item.
+func (u *UndoManager) redoMove(txn *Transaction, mv, target *Item) {
+	origin, originRight := neighbourOrigins(mv, mv.Right)
+	m := &Item{
+		ID:          ID{Client: txn.doc.clientID, Clock: txn.doc.store.NextClock(txn.doc.clientID)},
+		Origin:      origin,
+		OriginRight: originRight,
+		Left:        mv,
+		Parent:      mv.Parent,
+		Content:     NewContentMove(&target.ID, mv.Content.(*ContentMove).TargetLen),
+	}
+	mid := m.ID
+	mv.redone = &mid
+	m.integrate(txn, 0)
+	mv.delete(txn)
+}
+
+// yjsMergeable reports whether Yjs would hold left and right as one struct
+// (Item.mergeWith): adjacent, clock-contiguous, same origins and state, and
+// content that merges. Map entries and moved items are never grouped.
+func yjsMergeable(left, right *Item) bool {
+	n := left.Content.Len()
+	if left.Right != right || left.ID.Client != right.ID.Client || n == 0 ||
+		left.ID.Clock+uint64(n) != right.ID.Clock || left.Deleted != right.Deleted ||
+		left.redone != nil || right.redone != nil || left.MovedBy != nil || right.MovedBy != nil ||
+		left.ParentSub != nil || right.ParentSub != nil ||
+		!originIDEquals(right.Origin, &ID{Client: left.ID.Client, Clock: left.ID.Clock + uint64(n) - 1}) ||
+		!originIDEquals(left.OriginRight, right.OriginRight) {
+		return false
+	}
+	switch left.Content.(type) {
+	case *ContentAny:
+		_, ok := right.Content.(*ContentAny)
+		return ok
+	case *ContentString:
+		_, ok := right.Content.(*ContentString)
+		return ok
+	case *ContentJSON:
+		_, ok := right.Content.(*ContentJSON)
+		return ok
+	}
+	return false
+}
+
+// appendContents returns dst, an item's content copy, extended by the content
+// of rest, all of dst's mergeable kind (yjsMergeable). Linear in the run.
+func appendContents(dst Content, rest []*Item) Content {
+	if len(rest) == 0 {
+		return dst
+	}
+	switch d := dst.(type) {
+	case *ContentAny:
+		for _, r := range rest {
+			d.Vals = append(d.Vals, r.Content.(*ContentAny).Vals...)
+		}
+	case *ContentString:
+		var b strings.Builder
+		n := len(d.Str)
+		for _, r := range rest {
+			n += len(r.Content.(*ContentString).Str)
+		}
+		b.Grow(n)
+		b.WriteString(d.Str)
+		for _, r := range rest {
+			b.WriteString(r.Content.(*ContentString).Str)
+		}
+		return NewContentString(b.String())
+	case *ContentJSON:
+		for _, r := range rest {
+			d.Vals = append(d.Vals, r.Content.(*ContentJSON).Vals...)
+		}
+	}
+	return dst
 }
 
 // nextSameKey returns the next item to the right holding the same map key
@@ -548,6 +700,22 @@ func nextSameKey(item *Item) *Item {
 		}
 	}
 	return nil
+}
+
+// collectedWithParent reports whether r ends its key's chain in content-less
+// tombstones inside a deleted container: what a sender that collected the
+// container sends, where Yjs sends GC structs that join no list and so never
+// block undo. A collected value that a later live one overwrote still blocks.
+func collectedWithParent(r *Item) bool {
+	if pi := r.Parent.item; pi == nil || !pi.Deleted {
+		return false
+	}
+	for ; r != nil; r = nextSameKey(r) {
+		if _, gced := r.Content.(*ContentDeleted); !gced {
+			return false
+		}
+	}
+	return true
 }
 
 // deletedByStacks reports whether any stack item's deletions include id (Yjs
@@ -571,13 +739,12 @@ func (u *UndoManager) followRedone(txn *Transaction, item *Item) *Item {
 }
 
 // iterateItems calls fn for every store item inside ds, splitting items at
-// range boundaries (Yjs iterateDeletedStructs). Clients are visited in
-// ascending order so redo clocks are deterministic.
+// range boundaries (Yjs iterateDeletedStructs). Clients are visited in the
+// order they were first deleted, as in Yjs, so when two restored values share
+// a map key the same one wins.
 func (u *UndoManager) iterateItems(txn *Transaction, ds DeleteSet, fn func(*Item)) {
 	store := u.doc.store
-	clients := ds.Clients()
-	slices.Sort(clients)
-	for _, client := range clients {
+	for _, client := range ds.orderedClients() {
 		for _, r := range ds.clients[client] {
 			if r.Len == 0 || store.Find(ID{Client: client, Clock: r.Clock}) == nil {
 				continue
@@ -611,16 +778,11 @@ func insertedRanges(before, after StateVector) DeleteSet {
 }
 
 // neighbourOrigins computes the Origin / OriginRight IDs for a new item placed
-// immediately between left and right. The origin is left's LAST clock — left's
-// own ID clock for a single-unit item (most items, incl. format markers, occupy
-// one clock slot), or ID.Clock + Len - 1 for a multi-unit run.
+// immediately between left and right: left's last ID and right's first.
 func neighbourOrigins(left, right *Item) (origin, originRight *ID) {
 	if left != nil {
-		clock := left.ID.Clock
-		if n := left.Content.Len(); n > 0 {
-			clock += uint64(n) - 1
-		}
-		origin = &ID{Client: left.ID.Client, Clock: clock}
+		id := left.lastID()
+		origin = &id
 	}
 	if right != nil {
 		id := right.ID
@@ -669,6 +831,7 @@ func (u *UndoManager) typeInScope(t *abstractType) bool {
 // delete appends ranges out of clock order).
 func cloneDeleteSet(ds DeleteSet) DeleteSet {
 	out := newDeleteSet()
+	out.order = ds.orderedClients()
 	for client, ranges := range ds.clients {
 		cp := make([]DeleteRange, len(ranges))
 		copy(cp, ranges)

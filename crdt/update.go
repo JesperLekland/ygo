@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 
 	"github.com/reearth/ygo/encoding"
@@ -1306,17 +1307,57 @@ func wrapUpdateErr(err error) error {
 // fmtValToJSON serialises a ContentFormat/ContentEmbed/ContentJSON value as
 // JSON text, matching Yjs's JSON.stringify. HTML escaping is off because
 // JSON.stringify never escapes <, > or &.
+//
+// A non-finite number is written as null, as JSON.stringify does; any other
+// unencodable value (one that bypassed checkTextValue) panics, as WriteAny does.
 func fmtValToJSON(v any) string {
 	if v == nil {
 		return "null"
 	}
+	s, err := encodeJSONText(v)
+	if err != nil {
+		if s, err = encodeJSONText(nullNonFinite(v)); err != nil {
+			panic("crdt: value is not JSON-encodable: " + err.Error())
+		}
+	}
+	return s
+}
+
+func encodeJSONText(v any) (string, error) {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
 	enc.SetEscapeHTML(false)
 	if err := enc.Encode(v); err != nil {
-		return "null"
+		return "", err
 	}
-	return string(bytes.TrimSuffix(buf.Bytes(), []byte("\n")))
+	return string(bytes.TrimSuffix(buf.Bytes(), []byte("\n"))), nil
+}
+
+// nullNonFinite returns v with every NaN/±Inf replaced by nil.
+func nullNonFinite(v any) any {
+	switch t := v.(type) {
+	case float64:
+		if math.IsNaN(t) || math.IsInf(t, 0) {
+			return nil
+		}
+	case float32:
+		if f := float64(t); math.IsNaN(f) || math.IsInf(f, 0) {
+			return nil
+		}
+	case []any:
+		out := make([]any, len(t))
+		for i, e := range t {
+			out[i] = nullNonFinite(e)
+		}
+		return out
+	case map[string]any:
+		out := make(map[string]any, len(t))
+		for k, e := range t {
+			out[k] = nullNonFinite(e)
+		}
+		return out
+	}
+	return v
 }
 
 // fmtValFromJSON parses JSON text written by fmtValToJSON or Yjs's

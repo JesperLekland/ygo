@@ -857,9 +857,7 @@ func applyV2Txn(txn *Transaction, update []byte) (retErr error) {
 					txn.doc.store.pending.items = append(txn.doc.store.pending.items, item)
 					mergePendingMissing(txn.doc.store.pending.missing, client, parkedAt)
 				} else {
-					// Yjs integrates an item whose parent was collected as a GC struct, so
-					// it is stored deleted rather than live.
-					item.Deleted = true
+					item.markGCOrphan()
 					txn.doc.store.Append(item)
 				}
 			}

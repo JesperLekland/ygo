@@ -6,8 +6,8 @@
 // integrates the late write as a GC struct (its parent resolves to null), and
 // when the container is deleted but not yet collected, Item.integrate deletes
 // the late write because its parent is deleted. Either way the write is never
-// live. Each row records yjs's live insert set after replaying the same updates
-// two ways a server sees them:
+// live. Each row records yjs's live and deleted sets after replaying the same
+// updates two ways a server sees them:
 //   - one document receiving every update in order, and
 //   - a persisting server that decodes its saved state, applies one update and
 //     re-encodes, so the late write meets a container that is already a GC
@@ -29,13 +29,14 @@ function peer (clientID, base) {
 	return doc
 }
 
-// liveSet lists the non-deleted structs as [client, clock, length] ranges,
-// merging adjacent ones, sorted by client then clock.
-function liveSet (doc) {
+// idSet lists the structs whose deleted flag equals `deleted` as
+// [client, clock, length] ranges, merging adjacent ones, sorted by client then
+// clock. A GC struct counts as deleted.
+function idSet (doc, deleted) {
 	const out = []
 	for (const client of [...doc.store.clients.keys()].sort((a, b) => a - b)) {
 		for (const s of doc.store.clients.get(client)) {
-			if (s.deleted) continue
+			if (s.deleted !== deleted) continue
 			const last = out[out.length - 1]
 			if (last && last[0] === client && last[1] + last[2] === s.id.clock) last[2] += s.length
 			else out.push([client, s.id.clock, s.length])
@@ -44,11 +45,15 @@ function liveSet (doc) {
 	return out
 }
 
+function sets (doc) {
+	return { live: idSet(doc, false), deleted: idSet(doc, true) }
+}
+
 function replaySingleDoc (base, updates, apply) {
 	const doc = new Y.Doc()
 	apply(doc, base)
 	for (const u of updates) apply(doc, u)
-	return liveSet(doc)
+	return sets(doc)
 }
 
 function replayPersisting (base, updates, apply, encode) {
@@ -60,14 +65,16 @@ function replayPersisting (base, updates, apply, encode) {
 		apply(doc, u)
 		state = encode(doc)
 	}
-	return liveSet(doc)
+	return sets(doc)
 }
 
-// row builds the shared base document, lets `deleter` and `writer` diverge from
-// it, and records both wire versions of base and updates. The guard asserts the
-// writer's client has no live item in either replay; otherwise the scenario has
-// stopped exercising a stranded write.
-function row (name, setup, deleter, writer) {
+// row builds the shared base document, lets `deleter` (client 2) and `writer`
+// (client 3) diverge from it, and records both wire versions of base and
+// updates. With a `follower`, client 4 builds on the writer's update and its
+// own update arrives before the writer's, so it parks and then drains. The
+// guard asserts clients 3 and 4 have no live item in either replay; otherwise
+// the scenario has stopped exercising a stranded write.
+function row (name, setup, deleter, writer, follower) {
 	const origin = peer(1)
 	setup(origin)
 	const a = peer(2, Y.encodeStateAsUpdate(origin))
@@ -76,13 +83,21 @@ function row (name, setup, deleter, writer) {
 	const sb = Y.encodeStateVector(b)
 	deleter(a)
 	writer(b)
+	const peers = [[a, sa]]
+	if (follower) {
+		const c = peer(4, Y.encodeStateAsUpdate(b))
+		const sc = Y.encodeStateVector(c)
+		follower(c)
+		peers.push([c, sc])
+	}
+	peers.push([b, sb])
 	const v1 = {
 		base: Y.encodeStateAsUpdate(origin),
-		updates: [Y.encodeStateAsUpdate(a, sa), Y.encodeStateAsUpdate(b, sb)]
+		updates: peers.map(([d, sv]) => Y.encodeStateAsUpdate(d, sv))
 	}
 	const v2 = {
 		base: Y.encodeStateAsUpdateV2(origin),
-		updates: [Y.encodeStateAsUpdateV2(a, sa), Y.encodeStateAsUpdateV2(b, sb)]
+		updates: peers.map(([d, sv]) => Y.encodeStateAsUpdateV2(d, sv))
 	}
 	const expected = {
 		singleDoc: replaySingleDoc(v1.base, v1.updates, Y.applyUpdate),
@@ -92,8 +107,8 @@ function row (name, setup, deleter, writer) {
 	if (JSON.stringify(persistingV2) !== JSON.stringify(expected.persisting)) {
 		throw new Error(`fixture ${name}: V1 and V2 replays disagree`)
 	}
-	for (const [flow, live] of Object.entries(expected)) {
-		if (live.some(([client]) => client === 3)) {
+	for (const [flow, { live }] of Object.entries(expected)) {
+		if (live.some(([client]) => client >= 3)) {
 			throw new Error(`fixture ${name}: writer still has live items in the ${flow} replay`)
 		}
 	}
@@ -141,7 +156,31 @@ const rows = [
 			text.insert(0, 'Hello')
 		},
 		(a) => a.getMap('m').set('e', new Y.XmlElement('doc')),
-		(b) => b.getMap('m').get('e').get(0).get(0).insert(5, ' world'))
+		(b) => b.getMap('m').get('e').get(0).get(0).insert(5, ' world')),
+
+	// A nested type inserted into a container that was deleted: its children
+	// must not come back to life through the orphaned type.
+	row('nested_type_into_deleted_array',
+		(o) => o.getArray('r').insert(0, [new Y.Array()]),
+		(a) => a.getArray('r').delete(0),
+		(b) => {
+			const m = new Y.Map()
+			m.set('k', 'v')
+			m.set('t', new Y.Text('abc'))
+			b.getArray('r').get(0).insert(0, [m])
+		}),
+
+	// A third peer types after the stranded write, and its update arrives
+	// first, so it parks until the stranded write it depends on comes in.
+	row('chained_write_arrives_before_stranded_write',
+		(o) => {
+			const t = new Y.Text()
+			o.getMap('m').set('t', t)
+			t.insert(0, 'Hello')
+		},
+		(a) => a.getMap('m').delete('t'),
+		(b) => b.getMap('m').get('t').insert(5, '!'),
+		(c) => c.getMap('m').get('t').insert(6, '?'))
 ]
 
 const file = path.join(outDir, 'stranded_yjs_fixtures.json')

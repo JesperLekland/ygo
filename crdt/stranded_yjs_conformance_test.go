@@ -11,10 +11,15 @@ import (
 )
 
 type strandedFixture struct {
-	Name     string             `json:"name"`
-	V1       strandedWire       `json:"v1"`
-	V2       strandedWire       `json:"v2"`
-	Expected map[string][][]int `json:"expected"`
+	Name     string                  `json:"name"`
+	V1       strandedWire            `json:"v1"`
+	V2       strandedWire            `json:"v2"`
+	Expected map[string]strandedSets `json:"expected"`
+}
+
+type strandedSets struct {
+	Live    [][]int `json:"live"`
+	Deleted [][]int `json:"deleted"`
 }
 
 type strandedWire struct {
@@ -22,10 +27,16 @@ type strandedWire struct {
 	Updates []string `json:"updates"`
 }
 
-// liveRanges reports the doc's live insert set in the fixture's
-// [client, clock, length] shape, sorted by client then clock.
-func liveRanges(doc *crdt.Doc) [][]int {
-	set := crdt.InsertSetFromDoc(doc, true)
+// strandedSetsOf reports the doc's live insert set and delete set in the
+// fixture's [client, clock, length] shape, sorted by client then clock.
+func strandedSetsOf(doc *crdt.Doc) strandedSets {
+	return strandedSets{
+		Live:    idRanges(crdt.InsertSetFromDoc(doc, true)),
+		Deleted: idRanges(crdt.DeleteSetFromDoc(doc)),
+	}
+}
+
+func idRanges(set *crdt.IDSet) [][]int {
 	out := [][]int{}
 	for _, client := range set.Clients() {
 		for _, r := range set.Ranges(client) {
@@ -37,7 +48,7 @@ func liveRanges(doc *crdt.Doc) [][]int {
 
 // TestConformance_StrandedItems_MatchYjsLiveness replays yjs-authored updates in
 // which one peer writes into a nested type another peer deleted, and asserts
-// ygo leaves the same items live as yjs does.
+// ygo leaves the same items live and deleted as yjs does.
 //
 // yjs never keeps such a write: Item.integrate deletes an item whose parent is
 // deleted, and an item whose parent was already collected integrates as a GC
@@ -74,35 +85,49 @@ func TestConformance_StrandedItems_MatchYjsLiveness(t *testing.T) {
 				}
 
 				single := crdt.New()
-				mustApply(t, ver.apply, single, base)
+				applyAll(t, ver.apply, single, base)
 				for _, u := range updates {
-					mustApply(t, ver.apply, single, u)
+					applyAll(t, ver.apply, single, u)
 				}
-				if got := liveRanges(single); !reflect.DeepEqual(got, fx.Expected["singleDoc"]) {
-					t.Errorf("%s single doc: live %v, yjs %v", ver.tag, got, fx.Expected["singleDoc"])
+				assertNothingPending(t, single)
+				if got := strandedSetsOf(single); !reflect.DeepEqual(got, fx.Expected["singleDoc"]) {
+					t.Errorf("%s single doc: got %+v, yjs %+v", ver.tag, got, fx.Expected["singleDoc"])
 				}
 
 				state := base
 				var persisted *crdt.Doc
 				for _, u := range updates {
 					persisted = crdt.New()
-					mustApply(t, ver.apply, persisted, state)
-					mustApply(t, ver.apply, persisted, u)
+					applyAll(t, ver.apply, persisted, state)
+					applyAll(t, ver.apply, persisted, u)
 					state = ver.encode(persisted, nil)
 				}
-				if got := liveRanges(persisted); !reflect.DeepEqual(got, fx.Expected["persisting"]) {
-					t.Errorf("%s persist/reload: live %v, yjs %v", ver.tag, got, fx.Expected["persisting"])
+				assertNothingPending(t, persisted)
+				if got := strandedSetsOf(persisted); !reflect.DeepEqual(got, fx.Expected["persisting"]) {
+					t.Errorf("%s persist/reload: got %+v, yjs %+v", ver.tag, got, fx.Expected["persisting"])
 				}
 			}
 		})
 	}
 }
 
+// mustApply applies update and requires it to integrate fully.
 func mustApply(t *testing.T, apply func(*crdt.Doc, []byte, any) error, doc *crdt.Doc, update []byte) {
+	t.Helper()
+	applyAll(t, apply, doc, update)
+	assertNothingPending(t, doc)
+}
+
+// applyAll applies update, which may park items until a later update arrives.
+func applyAll(t *testing.T, apply func(*crdt.Doc, []byte, any) error, doc *crdt.Doc, update []byte) {
 	t.Helper()
 	if err := apply(doc, update, nil); err != nil {
 		t.Fatalf("apply: %v", err)
 	}
+}
+
+func assertNothingPending(t *testing.T, doc *crdt.Doc) {
+	t.Helper()
 	if ps := doc.PendingStats(); ps.Items > 0 {
 		t.Fatalf("%d items left pending", ps.Items)
 	}

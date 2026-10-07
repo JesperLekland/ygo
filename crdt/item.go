@@ -207,17 +207,18 @@ func (item *Item) integrate(txn *Transaction, offset int) {
 	// markers before it — so a subsequent nearby lookup still gets a cache hit.
 	// For hintless middle insertions (remote applies, where the rendered index
 	// is not known here) we conservatively clear all markers.
+	// The hint is one-shot for whichever item integrates next: a non-countable
+	// insert (ContentMove) must not leave it for a later, unrelated insert.
+	hint := item.Parent.insertHint
+	item.Parent.insertHint = 0
 	if !item.Deleted && item.Content.IsCountable() {
 		item.Parent.length += item.Content.Len()
 		if item.Right != nil {
-			if hint := item.Parent.insertHint; hint > 0 {
-				item.Parent.insertHint = 0
+			if hint > 0 {
 				item.Parent.updateMarkerChanges(hint, item.Content.Len())
 			} else {
 				item.Parent.clearMarkers()
 			}
-		} else {
-			item.Parent.insertHint = 0 // end-append: markers before the end stay valid.
 		}
 	}
 
@@ -381,11 +382,9 @@ func (item *Item) integrate(txn *Transaction, offset int) {
 // know the rendered position of the deleted item. For local transactions the
 // caller (deleteRange) performs the precise updateMarkerChanges(index, -len)
 // once, after tombstoning the range, so we skip any per-item work here (also
-// avoiding O(n²) clears across a multi-item delete). NOTE: transactInternal
-// hardcodes txn.Local=true even for remote applies, so this branch is dead on
-// the ApplyUpdate path — the remote delete-apply invalidation lives in
-// delete_set.go (applyToPartial). This branch only fires for the rare direct
-// item.delete under an explicitly non-local transaction.
+// avoiding O(n²) clears across a multi-item delete). applyToPartial in
+// delete_set.go also clears after each remote delete, so a caller-set Local
+// cannot leave stale markers.
 //
 // Cascade: when this item wraps a ContentType (nested YMap/YArray/YText/…),
 // every child item is recursively deleted so the delete-set encoded on the
@@ -413,8 +412,9 @@ func (item *Item) delete(txn *Transaction) {
 	// txn.Local since local move-deletes also take this path. ContentMove is
 	// non-countable, so the block above never runs for it.
 	if item.Parent != nil {
-		if _, ok := item.Content.(*ContentMove); ok {
+		if cm, ok := item.Content.(*ContentMove); ok {
 			item.Parent.clearMarkers()
+			rearbitrateMove(txn, item, cm)
 		} else if item.MovedBy != nil {
 			item.Parent.clearMarkers()
 		}
@@ -462,6 +462,9 @@ func splitItem(txn *Transaction, item *Item, offset int) *Item {
 		Content:     rightContent,
 		Deleted:     item.Deleted,
 	}
+	if item.redone != nil {
+		right.redone = &ID{Client: item.redone.Client, Clock: item.redone.Clock + uint64(offset)}
+	}
 	if right.Right != nil {
 		right.Right.Left = right
 	}
@@ -495,6 +498,60 @@ func originIDEquals(a, b *ID) bool {
 		return false
 	}
 	return a.Client == b.Client && a.Clock == b.Clock
+}
+
+// rearbitrateMove releases a target whose winning move was just tombstoned and
+// queues it for rearbitrateMoves at commit. Without this the target kept
+// MovedBy pointing at a dead move: still counted in length, rendered nowhere.
+func rearbitrateMove(txn *Transaction, move *Item, cm *ContentMove) {
+	if cm.Target == nil {
+		return
+	}
+	target := txn.doc.store.Find(*cm.Target)
+	if target == nil || target.MovedBy != move {
+		return
+	}
+	target.MovedBy = nil
+	if txn.rearbitrate == nil {
+		txn.rearbitrate = make(map[*abstractType]map[*Item]struct{})
+	}
+	set := txn.rearbitrate[move.Parent]
+	if set == nil {
+		set = make(map[*Item]struct{})
+		txn.rearbitrate[move.Parent] = set
+	}
+	set[target] = struct{}{}
+}
+
+// rearbitrateMoves hands each queued target to its next live move by the
+// integrate rule (lowest ClientID, then earliest clock), or back to its
+// origin when none remains. One pass per parent keeps a delete of many
+// winning moves linear rather than one list scan per move; a deleted parent
+// (a cascade) renders nothing, so it is skipped.
+func rearbitrateMoves(txn *Transaction) {
+	for parent, targets := range txn.rearbitrate {
+		if pi := parent.item; pi != nil && pi.Deleted {
+			continue
+		}
+		for target := range targets {
+			target.MovedBy = nil
+		}
+		for it := parent.start; it != nil; it = it.Right {
+			c, ok := it.Content.(*ContentMove)
+			if !ok || it.Deleted || c.Target == nil {
+				continue
+			}
+			target := txn.doc.store.Find(*c.Target)
+			if _, queued := targets[target]; !queued {
+				continue
+			}
+			if w := target.MovedBy; w == nil || it.ID.Client < w.ID.Client ||
+				(it.ID.Client == w.ID.Client && it.ID.Clock < w.ID.Clock) {
+				target.MovedBy = it
+			}
+		}
+		parent.clearMarkers()
+	}
 }
 
 // resolveMovedItem finds the item at targetID and ensures it covers exactly

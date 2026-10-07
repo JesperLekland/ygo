@@ -83,10 +83,14 @@ func (f *YXmlFragment) Len() int {
 //
 // While the fragment/element is detached the nodes are only buffered
 // (prelimChildren) and materialised when the subtree attaches — see
-// prelimFlusher. (#yxml-wire)
+// prelimFlusher. (#yxml-wire) Buffering a node that is f itself, or that
+// buffers f in its subtree, panics: the tree would contain itself.
 func (f *YXmlFragment) Insert(txn *Transaction, index int, nodes ...xmlNode) {
 	t := &f.abstractType
 	if t.detached() {
+		for _, n := range nodes {
+			rejectXMLCycle(t, n)
+		}
 		if index < 0 || index > len(f.prelimChildren) {
 			index = len(f.prelimChildren)
 		}
@@ -173,6 +177,38 @@ func (f *YXmlFragment) Delete(txn *Transaction, index, length int) {
 		return
 	}
 	deleteChildRange(&f.abstractType, txn, index, length)
+}
+
+// rejectXMLCycle panics when node is t or buffers t somewhere in its detached
+// subtree: the staged tree would contain itself and every recursive read of it
+// would overflow the stack. XML nodes carry no staging owner pointer, so this
+// walks node's buffered subtree (fragments and elements) without recursion;
+// seen keeps a node buffered under several parents from being walked twice.
+func rejectXMLCycle(t *abstractType, node xmlNode) {
+	stack := []xmlNode{node}
+	seen := make(map[*YXmlFragment]struct{})
+	for len(stack) > 0 {
+		n := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if n.baseXMLType() == t {
+			panic("crdt: Insert: staging this node here would create a cycle (a node cannot contain itself)")
+		}
+		var f *YXmlFragment
+		switch c := n.(type) {
+		case *YXmlFragment:
+			f = c
+		case *YXmlElement:
+			f = &c.YXmlFragment
+		}
+		if f == nil || len(f.prelimChildren) == 0 {
+			continue
+		}
+		if _, dup := seen[f]; dup {
+			continue
+		}
+		seen[f] = struct{}{}
+		stack = append(stack, f.prelimChildren...)
+	}
 }
 
 // flushPrelim materialises children buffered while this fragment was detached.

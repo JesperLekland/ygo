@@ -1,3 +1,20 @@
+## v1.51.7
+
+**Who is affected:** servers that store or exchange large full-document updates,
+such as checkpoints from documents with many clients, where structs refer to
+other structs later in the same update.
+
+**Complete checkpoints no longer fail the pending limit.** ygo parked any
+struct whose dependency had not been integrated yet, and counted it against
+the limit on pending structs. A complete but large checkpoint could therefore
+be rejected, so the document could not be loaded from it. ygo now resolves
+dependencies inside the update first; only structs that are still missing
+afterwards count against the limit. If an update is rejected, none of its structs are added to
+the pending queue, but changes already applied before the rejection stay.
+Incomplete or crafted updates are still rejected quickly and with little
+memory. The pending limit, wire format and public API are unchanged. Thanks
+to @kovaa-dev.
+
 ## v1.51.6
 
 **Replacing a map value no longer scans unrelated keys.** Direct replacements

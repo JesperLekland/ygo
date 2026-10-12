@@ -1,3 +1,11 @@
+## v1.51.9
+
+**Map updates avoid unrelated-key conflict scans.** New keys and replacements
+immediately after their current winner bypass the scan; concurrent writes
+resolve against the same key. XML attributes and child elements use separate
+conflict orders, preserving child order regardless of update delivery order.
+The public API and wire format are unchanged.
+
 ## v1.51.8
 
 **Who is affected:** servers that apply updates from untrusted peers. Updates

@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.51.9] — 2026-10-12
+
+### Performance
+
+- **`crdt`: avoid unrelated-key conflict scans during map integration.** New
+  keys and causal replacements after the current key winner bypass the scan;
+  contended writes consider only the same key. XML children and attributes keep
+  separate conflict orders, so concurrent child order is independent of delivery.
+
 ## [1.51.8] — 2026-10-11
 
 ### Fixed

@@ -1,5 +1,14 @@
 ## v1.51.10
 
+**Crafted V2 updates can no longer pin a CPU core.** This affects servers
+on v1.51.8 or v1.51.9 that apply V2 updates from untrusted peers. v1.51.8 added
+a scan of an update's group headers before decoding. For JSON content in a V2
+update, the scan did work proportional to the item's declared length, up to
+about a million steps per item, without reading any input. An update of a few
+dozen bytes could keep a core busy for seconds, and a crafted one for much
+longer, before being rejected. The scan now skips that content in constant
+time.
+
 **Who is affected: anyone who stores rooms with `persistence.MemoryPersistence`,
 `persistence.FilePersistence` or `persistence/sqlite` (for example through
 `NewServerWithPersistence(persistence.NewLegacyAdapter(...))`), and anyone who

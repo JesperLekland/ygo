@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`crdt`: a small crafted V2 update could pin a CPU core.** Since v1.51.8,
+  `ApplyUpdateV2` scans group headers before decoding an update with more than
+  one client group. For a JSON item, that scan stepped over each declared value
+  without reading any bytes, so a length the update could never supply cost up
+  to about a million iterations per item. An update of a few dozen bytes could
+  spin for seconds, and a crafted one far longer, before being rejected. The
+  scan now skips V2 JSON content in constant time. V1 updates and valid V2
+  updates are unaffected.
 - **`persistence`: the bundled stores keep large incremental updates instead
   of refusing them, and every edit after them.** `MemoryPersistence`,
   `FilePersistence` and `sqlite.Store` check an update in `AppendUpdate` by

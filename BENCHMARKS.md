@@ -367,12 +367,10 @@ fixtures and options on both revisions. Allocation volume is cumulative, not pea
 Local results: Apple M4 Pro, macOS arm64, Go 1.26.8; ten serial alternating
 samples per revision with identical fixtures. Before is main `8ca1701`; after
 is the resolver at `404ae02` on the same base. Both accept every complete fixture below
-with cap=16. The overlap scenario calls the resolver directly.
-
-Time/allocations are medians; allocation volume is cumulative. Peak RSS is the
-maximum of three fresh processes applying identical prepared wire bytes.
-Fixture generation and compilation are excluded; runtime/input/document included.
-Complete-update timers exclude document lifecycle and result checks.
+with cap=16. The overlap scenario calls the resolver directly. Time and
+allocations are medians. Peak RSS is the maximum of three fresh processes
+applying identical prepared wire bytes, excluding fixture generation and
+compilation.
 
 Temporary scheduler storage adds about 0.40 MiB at 10k queued items,
 0.79 MiB at 20k and 1.89 MiB for 40k contiguous items. The four ordinary
@@ -430,3 +428,35 @@ ApplyUpdate V1/V2 benchmarks show no significant time/allocation change.
 | Time, ms/op | 327.309 | 1.822 |
 | Allocated, MiB/op | 1.615 | 2.015 |
 | Allocations/op | 10,141.0 | 10,144.5 |
+
+## Interleaved clients
+
+`BenchmarkInterleavedTyping` (`crdt/pending_resolver_bench_test.go`, heavy
+tier) builds the history from #311: five peers take 20,000 turns appending to
+one text, so every struct's origin is another client's struct. It loads the
+encoded state into a fresh document, merges that state with the last 500
+per-turn updates, and applies all 20,000 updates newest first.
+
+```sh
+go test -tags benchheavy ./crdt -run '^$' -bench '^BenchmarkInterleavedTyping$' \
+  -benchmem -benchtime=10x -count=6
+```
+
+Local results: Apple M4 Max, macOS arm64, Go 1.27.2. Before is main with the
+within-update resolver above; after adds the clock waiters and single-walk
+parent inference. Medians.
+
+| Path | Before | After |
+|---|---:|---:|
+| Load full state, ms/op | 204.7 | 7.6 |
+| Load full state, MiB/op | 6.62 | 7.78 |
+| Merge state + 500 updates, ms/op | 1,807.5 | 4.0 |
+| Merge state + 500 updates, MiB/op | 7.29 | 7.06 |
+| Apply newest first, ms/op | 3,107.1 | 11.6 |
+| Apply newest first, MiB/op | 6,498.0 | 17.9 |
+
+On the resolver benchmarks above, `LinearClientQueue` and `OverlapFallback`
+show no significant change and `MultiStructChain` is within 7% (V2, 1k
+clients); the waiters only run on what the dependency walk leaves. The
+ordinary `ApplyUpdateV1/V2` and `MergeUpdatesV1` benchmarks show no
+significant change.

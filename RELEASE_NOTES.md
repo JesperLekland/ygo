@@ -1,3 +1,31 @@
+## v1.52.0
+
+**Who is affected: nobody, unless you choose to be.** If your server never
+cancels a request context with a cause of its own, nothing changes.
+
+**What is new.** A server that embeds `provider/websocket` can now end a single
+peer's session with an application close code. Cancel that peer's request
+context with `context.WithCancelCause`, passing a cause that implements
+`CloseCode() (int, string)`. The peer then receives a close frame with that code
+and reason instead of the connection simply dropping.
+
+This is for cases where the client needs to know *why* it was disconnected —
+for example, a user whose access was revoked while their document was open.
+Without a close code, the client sees an abnormal closure (1006), which looks
+like a network failure, so it reconnects. With one (say 4001, "session
+revoked"), the client can stop and tell the user what happened.
+
+The cause may be wrapped, as in `fmt.Errorf("revoking %s: %w", user, cause)`.
+Only codes 1000 and 3000–4999 are sent, since a client rejects the others as a
+protocol error. The reason is truncated to 123 bytes, the most a close frame can
+carry, and invalid UTF-8 is dropped from it. From the cancel on, the server
+ignores everything the peer sends, so a revoked client cannot keep editing by
+not reading its socket; the close frame waits at most one second.
+
+**What stays the same.** A context cancelled with any other cause, with no
+cause, or with a code that cannot be sent closes the socket exactly as before,
+with no close frame. No exported API was added. Closes #264.
+
 ## v1.51.13
 
 **Who is affected:** servers that apply updates from peers they do not trust,

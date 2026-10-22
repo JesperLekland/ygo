@@ -101,7 +101,7 @@ const (
 	msgStateless          = uint64(5)  // arbitrary VarString payload, surfaced via Server.OnStateless
 	msgBroadcastStateless = uint64(6)  // VarString payload, fanned out to other peers as msgStateless
 	msgClose              = uint64(7)  // peer-requested graceful close (optional VarString reason)
-	msgSyncStatus         = uint64(8)  // server→client update-applied ack; if a client sends it, no-op consume
+	msgSyncStatus         = uint64(8)  // server→client ack of each SyncStep2/Update, sent with HocuspocusFraming; a client's is consumed
 	msgPing               = uint64(9)  // liveness check; replies with msgPong
 	msgPong               = uint64(10) // liveness reply to a server-sent Ping; no-op
 )
@@ -884,6 +884,10 @@ type Server struct {
 	// VarString(docName) + <y-websocket frame>. Enables real @hocuspocus/provider
 	// interop. One room per connection is still enforced (no multi-document
 	// multiplexing); the inbound docName is read and used only for logging.
+	// Such a connection is also answered one SyncStatus (tag 8) frame for every
+	// SyncStep2 or Update it sends, in order, and closed with 1002 when it sends
+	// a sync frame that does not decode (see the package documentation for the
+	// answers).
 	// Leave false (default) for native y-websocket clients — the two framings
 	// cannot be auto-detected on one endpoint.
 	HocuspocusFraming bool
@@ -2105,7 +2109,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// closes. The read loop drops input meanwhile, since WriteControl can
 			// wait on a writer stuck on a peer that has stopped reading.
 			if frame := closeFrameFor(context.Cause(ctx)); frame != nil {
-				p.revoked.Store(true)
+				p.inputClosed.Store(true)
 				_ = ws.WriteControl(gws.CloseMessage, frame, time.Now().Add(closeFrameTimeout))
 			}
 			_ = ws.Close() // close errors during teardown are expected; not logged
@@ -2145,8 +2149,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			break
 		}
-		if p.revoked.Load() {
-			// continue, not break: the deferred Close would race the close frame.
+		if p.inputClosed.Load() {
+			// A close is queued or sent: nothing more from this peer lands.
+			// continue, not break: the deferred teardown would drop the
+			// queued close frame or race the one being sent.
 			continue
 		}
 		if firstMessage {

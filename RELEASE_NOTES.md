@@ -1,3 +1,79 @@
+## v1.54.0
+
+**Who is affected: servers that set `HocuspocusFraming` for
+`@hocuspocus/provider` clients.** Connections on plain y-websocket framing get
+no `SyncStatus`. On either framing, a partly applied update now reaches the
+room's other peers (below).
+
+`@hocuspocus/provider` counts the edits it has sent and lowers the count only
+when the server answers one with a `SyncStatus` (tag 8) message, which
+`@hocuspocus/server` sends after every SyncStep2 or Update. ygo defined the tag
+but never sent it, so against ygo the provider's `hasUnsyncedChanges` stayed
+true for as long as the connection lived, and an editor could never tell its
+edits had reached the server.
+
+With `HocuspocusFraming` set, ygo now answers every SyncStep2 or Update, under
+Sync (tag 0) or SyncReply (tag 4), with exactly one `SyncStatus`, in the order
+the frames arrived, so a client can pair each answer with the frame it sent:
+
+| The client sends | The room | `SyncStatus` |
+|---|---|---|
+| a SyncStep2 or Update | applies it | 1 |
+| a SyncStep2 or Update | does not fully apply it (it overflows `MaxPendingItems`, say) | 0 |
+| an Update, read-only | does not take it | 0 |
+| a SyncStep2, read-only | already holds everything in it | 1 |
+| a SyncStep2, read-only | lacks something in it, and does not take it | 0 |
+| a sync frame that does not decode | closes the connection with 1002 | none |
+
+Three answers differ from `@hocuspocus/server` 2.15.3, on purpose:
+
+- **An update the room does not fully apply.** `@hocuspocus/server` answers 1
+  there: Yjs has no cap on pending structs, so it parks an update that
+  overflows `MaxPendingItems`, and y-protocols swallows any error from an
+  update that does not decode. An answer of 1 tells the client the room holds
+  an edit it does not. ygo answers 0 and keeps the connection, so the client
+  keeps the edit. An unrelated update on the same connection is answered 1.
+  The client's own next edits come after the part the room never took, so
+  the room parks them waiting for it: each is answered 1 while it fits under
+  the cap, as any update that parks is, and 0 once the cap is full. The room
+  shows none of them until the part it lacks arrives.
+- **A sync message that does not decode** (its sub-type is unknown or
+  missing, or its payload is cut short). On a read-write connection,
+  `@hocuspocus/server` answers a SyncStep2 or Update whose payload is cut short
+  with 1 and keeps the connection, because y-protocols' `readSyncStep2` catches
+  the read error along with the apply error. Other such messages get 0 (a
+  read-only Update) or a 4403 close (an unknown or missing sub-type, a SyncStep1,
+  a read-only SyncStep2). ygo sends no `SyncStatus` for any of them and closes
+  with 1002 (protocol error): an answer of 1 would acknowledge an edit the room
+  never saw, and 4403 would strand the provider. From the moment ygo queues
+  that close, it handles no later frame from the connection, including frames
+  already received.
+- **A read-only SyncStep2 whose update does not decode.** `@hocuspocus/server`
+  closes the connection with 4403, because its `snapshotContainsUpdate` check
+  throws. ygo answers 0 and keeps the connection: the room does not hold the
+  update, and 4403 would strand the provider.
+
+`crdt.SnapshotContainsUpdateV1` is new: it reports whether a snapshot already
+holds everything a V1 update carries, as Yjs `snapshotContainsUpdate` does.
+`crdt.DocContainsUpdateV1` is new too: the same check against a live document,
+which decodes the update first, takes only the document's read lock, and
+checks the update's deletion ranges against the store in one forward pass per
+client. The read-only SyncStep2 answer uses it, so the answer to a viewer's
+SyncStep2 no longer takes the room's exclusive lock.
+
+**The part of a partly applied update now reaches the other peers.** ygo
+integrates an update item by item, so one that overflows `MaxPendingItems` can
+leave part of itself in the room. The server used to broadcast nothing for
+such an update; it now broadcasts exactly the part that integrated, on either
+framing. `crdt.ApplyUpdateV1Landed` is new: it applies an update as
+`ApplyUpdateV1` does and, when the apply fails, returns that part as a V1
+update.
+
+**Closing a connection now stops its input.** Once the server queues a close
+for a connection (the 1002 above, or 4401 after a failed in-band auth), the
+read loop handles nothing more from it, as it already did after a
+context-cause close.
+
 ## v1.53.1
 
 **Who is affected: servers that set `RoomIdleTimeout` and write to rooms with

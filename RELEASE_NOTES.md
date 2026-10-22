@@ -74,6 +74,52 @@ for a connection (the 1002 above, or 4401 after a failed in-band auth), the
 read loop handles nothing more from it, as it already did after a
 context-cause close.
 
+**Who is affected: servers that want to look at a read-write peer's update
+before it applies** — a per-document size bound, schema validation, write
+moderation — or that want a lock of their own held across the apply.
+
+`Server.OnPeerUpdate`, if set, runs in place of the room's own apply of a
+read-write peer's SyncStep2 or Update (Sync/SyncReply, tags 0/4). It is handed
+the room name, its document, the update's V1 bytes and the transaction origin,
+and an `apply` function that applies the update exactly as the room does
+without a hook. A second call to `apply` returns `ErrPeerUpdateApplied`.
+`apply` must be called before the hook returns: a call after that applies
+nothing and returns `ErrPeerUpdateHookReturned`, since by then the peer has
+been answered and the update would reach no other peer.
+
+An update the hook refuses (it returns, or panics, without `apply` having
+applied it) is not broadcast, is answered `SyncStatus(0)` on a
+Hocuspocus-framed connection, and closes the peer after that answer:
+
+| The hook | Close |
+|---|---|
+| returns or wraps a `*PeerClose{Code, Reason}`, Code 1000 or 3000-4999 | Code and Reason, the reason cut to 123 bytes at a rune boundary |
+| returns a `*PeerClose` with any other code | 4205 "Reset Connection" |
+| returns any other error, or panics | 4205 "Reset Connection" |
+
+The close is needed because the client's later edits build on the refused
+one, so the room could not integrate them: without it they would park in the
+room, be answered `SyncStatus(1)` and reach the other peers, who would park
+them too. The client still holds the refused edit, so when it reconnects it
+sends it again, with any edit built on it, and the hook sees each of them
+again; an edit the hook applies that builds on a refused one parks in the
+room. `@hocuspocus/provider` 2.x reconnects at once after a 4205 close, so a
+hook that keeps refusing a 2.x client keeps closing it; a `*PeerClose` with
+4401 stops it reconnecting. 4.x waits its configured `delay` first. Plain
+y-websocket connections are closed the same way.
+
+When the hook calls `apply` and the room itself does not take the update (it
+overflows `MaxPendingItems`, say), the peer is answered as without a hook and
+keeps the connection, unless the hook returns a `*PeerClose`. An update
+`apply` applied is broadcast and answered `SyncStatus(1)` whatever the hook
+returns afterward. Read-only peers never reach the hook, as before. Nil, the
+default, leaves every peer's update applied exactly as it was.
+
+This is the counterpart of `@hocuspocus/server`'s `beforeHandleMessage`
+(`packages/server/src/Connection.ts`), which runs before the message
+handler's own apply and closes the connection on a rejection with the error's
+code and reason, or with `ResetConnection` (4205) when it has none.
+
 ## v1.53.1
 
 **Who is affected: servers that set `RoomIdleTimeout` and write to rooms with

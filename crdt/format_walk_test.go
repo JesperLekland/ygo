@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func TestUnit_YText_WalkFormatting_InvisibleBoundaries(t *testing.T) {
@@ -64,15 +66,22 @@ func TestUnit_YText_WalkFormatting_InvisibleBoundaries(t *testing.T) {
 			}
 			checkpoint := EncodeStateAsUpdateV1(actual, nil)
 			markers := uint64(0)
+			var values []any
+			expectedValues := make([]any, 0, 2*writers)
+			for i := range writers {
+				expectedValues = append(expectedValues, map[string]any{"weight": float64(i + 1)}, nil)
+			}
 			if err := current.WalkFormatting(func(key string, value any) error {
 				if key != "format" {
 					t.Fatal(key)
 				}
 				markers++
+				values = append(values, value)
 				return nil
 			}); err != nil {
 				t.Fatal(err)
 			}
+			assert.ElementsMatch(t, expectedValues, values)
 			total := uint64(0)
 			live := InsertSetFromDoc(actual, true)
 			for _, client := range live.Clients() {
@@ -80,8 +89,8 @@ func TestUnit_YText_WalkFormatting_InvisibleBoundaries(t *testing.T) {
 					total += span.Len
 				}
 			}
-			if markers == 0 || total != 3+markers {
-				t.Fatal("independent live-clock mismatch", markers, total)
+			if markers != uint64(2*writers) || total != 3+markers {
+				t.Fatal("unexpected live markers or live clocks", markers, total)
 			}
 			if !bytes.Equal(checkpoint, EncodeStateAsUpdateV1(actual, nil)) {
 				t.Fatal("visitor modified native document")
@@ -92,7 +101,6 @@ func TestUnit_YText_WalkFormatting_InvisibleBoundaries(t *testing.T) {
 			if !errors.Is(err, sentinel) || calls != 1 {
 				t.Fatal("callback failure not preserved", err, calls)
 			}
-			t.Log("live markers", markers, "total live clocks", total)
 		})
 	}
 }
@@ -154,5 +162,32 @@ func TestUnit_YText_WalkFormatting_ValuesAndEarlyReturn(t *testing.T) {
 	doc.Transact(func(tx *Transaction) { text.Insert(tx, 3, "d", nil) })
 	if got := text.ToString(); got != "abcd" {
 		t.Fatalf("unexpected text after callback error: %q", got)
+	}
+}
+
+func TestUnit_YText_WalkFormatting_SkipsDeletedMarkers(t *testing.T) {
+	doc := New(WithGC(false))
+	defer doc.Destroy()
+	text := doc.GetText("text")
+	doc.Transact(func(tx *Transaction) {
+		text.Insert(tx, 0, "abc", nil)
+		text.Format(tx, 1, 1, Attributes{"bold": true})
+	})
+	doc.Transact(func(tx *Transaction) { text.Delete(tx, 0, 3) })
+	retained := 0
+	for item := text.start; item != nil; item = item.Right {
+		if _, ok := item.Content.(*ContentFormat); ok && item.Deleted {
+			retained++
+		}
+	}
+	if retained == 0 {
+		t.Fatal("expected retained deleted formatting markers")
+	}
+	markers := 0
+	if err := text.WalkFormatting(func(string, any) error { markers++; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if markers != 0 {
+		t.Fatalf("visited %d deleted markers", markers)
 	}
 }
